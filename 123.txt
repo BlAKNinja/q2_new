@@ -1,0 +1,537 @@
+import reactpy
+from reactpy import component, html, hooks, use_state, use_effect
+from reactpy.backend.starlette import configure
+from starlette.applications import Starlette
+import aiohttp
+import json
+import asyncio
+from datetime import datetime
+import uuid
+
+# Main application component
+@component
+def Handler():
+    # State for tabs
+    active_tab, set_active_tab = use_state("builder")
+    
+    # State for request builder
+    method, set_method = use_state("GET")
+    url, set_url = use_state("")
+    headers, set_headers = use_state([{"id": str(uuid.uuid4()), "key": "", "value": "", "enabled": True}])
+    params, set_params = use_state([{"id": str(uuid.uuid4()), "key": "", "value": "", "enabled": True}])
+    body_type, set_body_type = use_state("none")
+    body_content, set_body_content = use_state("")
+    auth_type, set_auth_type = use_state("no-auth")
+    auth_data, set_auth_data = use_state({})
+    
+    # State for response
+    response, set_response = use_state(None)
+    response_time, set_response_time = use_state(None)
+    response_size, set_response_size = use_state(None)
+    
+    # State for collections
+    collections, set_collections = use_state([])
+    active_collection, set_active_collection = use_state(None)
+    
+    # State for history
+    history, set_history = use_state([])
+    history_search, set_history_search = use_state("")
+    
+    # State for environments
+    environments, set_environments = use_state([])
+    active_environment, set_active_environment = use_state(None)
+    
+    # State for tabs (multiple requests)
+    request_tabs, set_request_tabs = use_state([{"id": str(uuid.uuid4()), "name": "New Request", "saved": False}])
+    active_request_tab, set_active_request_tab = use_state(0)
+    
+    # Deep purple theme colors
+    theme = {
+        "primary": "#5E35B1",
+        "primary_light": "#9575CD",
+        "primary_dark": "#4527A0",
+        "secondary": "#EDE7F6",
+        "accent": "#7C4DFF",
+        "text_primary": "#212121",
+        "text_secondary": "#757575",
+        "divider": "#BDBDBD",
+        "background": "#FAFAFA",
+        "card": "#FFFFFF",
+        "error": "#F44336",
+        "warning": "#FF9800",
+        "success": "#4CAF50",
+        "info": "#2196F3"
+    }
+    
+    # Styles
+    styles = {
+        "app": {
+            "display": "flex",
+            "flex_direction": "column",
+            "height": "100vh",
+            "font_family": "'Inter', 'Segoe UI', sans-serif",
+            "background_color": theme["background"],
+            "color": theme["text_primary"]
+        },
+        "header": {
+            "display": "flex",
+            "align_items": "center",
+            "padding": "0 16px",
+            "height": "50px",
+            "background_color": theme["primary"],
+            "color": "white",
+            "box_shadow": "0 2px 4px rgba(0,0,0,0.2)"
+        },
+        "main": {
+            "display": "flex",
+            "flex_grow": 1,
+            "overflow": "hidden"
+        },
+        "sidebar": {
+            "width": "200px",
+            "background_color": theme["secondary"],
+            "border_right": f"1px solid {theme['divider']}",
+            "padding": "16px",
+            "overflow_y": "auto"
+        },
+        "content": {
+            "flex_grow": 1,
+            "display": "flex",
+            "flex_direction": "column",
+            "overflow": "hidden"
+        },
+        "tabs": {
+            "display": "flex",
+            "border_bottom": f"1px solid {theme['divider']}",
+            "background_color": theme["card"]
+        },
+        "tab": {
+            "padding": "12px 16px",
+            "cursor": "pointer",
+            "border_bottom": "2px solid transparent",
+            "font_weight": "500"
+        },
+        "active_tab": {
+            "padding": "12px 16px",
+            "cursor": "pointer",
+            "border_bottom": f"2px solid {theme['primary']}",
+            "color": theme["primary"],
+            "font_weight": "600"
+        },
+        "request_tabs": {
+            "display": "flex",
+            "background_color": theme["card"],
+            "border_bottom": f"1px solid {theme['divider']}"
+        },
+        "request_tab": {
+            "padding": "8px 16px",
+            "cursor": "pointer",
+            "border_right": f"1px solid {theme['divider']}",
+            "display": "flex",
+            "align_items": "center",
+            "gap": "8px"
+        },
+        "active_request_tab": {
+            "padding": "8px 16px",
+            "cursor": "pointer",
+            "border_right": f"1px solid {theme['divider']}",
+            "background_color": theme["primary_light"],
+            "color": "white",
+            "display": "flex",
+            "align_items": "center",
+            "gap": "8px"
+        },
+        "tab_content": {
+            "flex_grow": 1",
+            "padding": "16px",
+            "overflow_y": "auto",
+            "background_color": theme["card"]
+        },
+        "section": {
+            "margin_bottom": "24px",
+            "border": f"1px solid {theme['divider']}",
+            "border_radius": "4px",
+            "overflow": "hidden"
+        },
+        "section_header": {
+            "padding": "12px 16px",
+            "background_color": theme["secondary"],
+            "font_weight": "600",
+            "display": "flex",
+            "justify_content": "space-between",
+            "align_items": "center"
+        },
+        "section_content": {
+            "padding": "16px"
+        },
+        "input": {
+            "padding": "8px 12px",
+            "border": f"1px solid {theme['divider']}",
+            "border_radius": "4px",
+            "width": "100%",
+            "margin_bottom": "8px"
+        },
+        "select": {
+            "padding": "8px 12px",
+            "border": f"1px solid {theme['divider']}",
+            "border_radius": "4px",
+            "background": "white"
+        },
+        "button": {
+            "padding": "8px 16px",
+            "background_color": theme["primary"],
+            "color": "white",
+            "border": "none",
+            "border_radius": "4px",
+            "cursor": "pointer",
+            "font_weight": "500"
+        },
+        "button_secondary": {
+            "padding": "8px 16px",
+            "background_color": theme["secondary"],
+            "color": theme["text_primary"],
+            "border": f"1px solid {theme['divider']}",
+            "border_radius": "4px",
+            "cursor": "pointer"
+        },
+        "key_value_table": {
+            "width": "100%",
+            "border_collapse": "collapse"
+        },
+        "key_value_row": {
+            "margin_bottom": "8px",
+            "display": "flex",
+            "align_items": "center",
+            "gap": "8px"
+        },
+        "key_value_input": {
+            "flex": 1,
+            "padding": "8px 12px",
+            "border": f"1px solid {theme['divider']}",
+            "border_radius": "4px"
+        },
+        "checkbox": {
+            "margin_right": "8px"
+        },
+        "response_container": {
+            "border": f"1px solid {theme['divider']}",
+            "border_radius": "4px",
+            "overflow": "hidden",
+            "margin_top": "16px"
+        },
+        "response_status_bar": {
+            "padding": "12px 16px",
+            "background_color": theme["secondary"],
+            "display": "flex",
+            "justify_content": "space-between",
+            "align_items": "center"
+        },
+        "response_body": {
+            "padding": "16px",
+            "background_color": "#263238",
+            "color": "#ECEFF1",
+            "font_family": "'Fira Code', monospace",
+            "white_space": "pre-wrap",
+            "max_height": "400px",
+            "overflow_y": "auto"
+        },
+        "history_list": {
+            "list_style": "none",
+            "padding": "0",
+            "margin": "0"
+        },
+        "history_item": {
+            "padding": "8px 12px",
+            "border_bottom": f"1px solid {theme['divider']}",
+            "cursor": "pointer",
+            "display": "flex",
+            "justify_content": "space-between",
+            "align_items": "center"
+        },
+        "collection_list": {
+            "list_style": "none",
+            "padding": "0",
+            "margin": "0"
+        },
+        "collection_item": {
+            "padding": "8px 12px",
+            "border_bottom": f"1px solid {theme['divider']}",
+            "cursor": "pointer"
+        },
+        "badge": {
+            "padding": "2px 6px",
+            "border_radius": "12px",
+            "font_size": "12px",
+            "font_weight": "600"
+        },
+        "method_badge": {
+            "padding": "2px 6px",
+            "border_radius": "4px",
+            "font_size": "12px",
+            "font_weight": "600",
+            "color": "white",
+            "min_width": "50px",
+            "text_align": "center"
+        }
+    }
+    
+    # Method badge colors
+    method_colors = {
+        "GET": "#4CAF50",
+        "POST": "#2196F3",
+        "PUT": "#FF9800",
+        "DELETE": "#F44336",
+        "PATCH": "#9C27B0",
+        "HEAD": "#607D8B",
+        "OPTIONS": "#009688"
+    }
+    
+    # Add a new request tab
+    def add_request_tab():
+        new_tab = {
+            "id": str(uuid.uuid4()),
+            "name": "New Request",
+            "saved": False
+        }
+        set_request_tabs([*request_tabs, new_tab])
+        set_active_request_tab(len(request_tabs))
+    
+    # Close a request tab
+    def close_request_tab(index, event):
+        event.stopPropagation()
+        if len(request_tabs) > 1:
+            new_tabs = request_tabs.copy()
+            new_tabs.pop(index)
+            set_request_tabs(new_tabs)
+            if active_request_tab >= index:
+                set_active_request_tab(max(0, active_request_tab - 1))
+    
+    # Update key-value pairs (headers, params)
+    def update_key_value(items, set_items, index, field, value):
+        new_items = items.copy()
+        new_items[index][field] = value
+        set_items(new_items)
+    
+    # Add a new key-value pair
+    def add_key_value(items, set_items):
+        new_items = items.copy()
+        new_items.append({"id": str(uuid.uuid4()), "key": "", "value": "", "enabled": True})
+        set_items(new_items)
+    
+    # Remove a key-value pair
+    def remove_key_value(items, set_items, index):
+        if len(items) > 1:
+            new_items = items.copy()
+            new_items.pop(index)
+            set_items(new_items)
+    
+    # Toggle key-value pair enabled state
+    def toggle_key_value(items, set_items, index):
+        new_items = items.copy()
+        new_items[index]["enabled"] = not new_items[index]["enabled"]
+        set_items(new_items)
+    
+    # Send HTTP request
+    async def send_request():
+        start_time = datetime.now()
+        
+        # Prepare headers
+        request_headers = {}
+        for header in headers:
+            if header["enabled"] and header["key"] and header["value"]:
+                request_headers[header["key"]] = header["value"]
+        
+        # Prepare params
+        request_params = {}
+        for param in params:
+            if param["enabled"] and param["key"] and param["value"]:
+                request_params[param["key"]] = param["value"]
+        
+        # Prepare body
+        request_body = None
+        if body_type != "none" and body_content:
+            if body_type == "json":
+                try:
+                    request_body = json.dumps(json.loads(body_content))
+                    request_headers["Content-Type"] = "application/json"
+                except:
+                    request_body = body_content
+            else:
+                request_body = body_content
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.request(
+                    method=method,
+                    url=url,
+                    headers=request_headers,
+                    params=request_params,
+                    data=request_body
+                ) as resp:
+                    response_text = await resp.text()
+                    end_time = datetime.now()
+                    
+                    # Calculate response time and size
+                    response_time_ms = (end_time - start_time).total_seconds() * 1000
+                    response_size_bytes = len(response_text.encode('utf-8'))
+                    
+                    # Format response size
+                    if response_size_bytes < 1024:
+                        response_size_str = f"{response_size_bytes} B"
+                    elif response_size_bytes < 1024 * 1024:
+                        response_size_str = f"{response_size_bytes / 1024:.2f} KB"
+                    else:
+                        response_size_str = f"{response_size_bytes / (1024 * 1024):.2f} MB"
+                    
+                    # Add to history
+                    history_item = {
+                        "id": str(uuid.uuid4()),
+                        "method": method,
+                        "url": url,
+                        "timestamp": datetime.now(),
+                        "status": resp.status,
+                        "time": response_time_ms,
+                        "size": response_size_str
+                    }
+                    set_history([history_item] + history)
+                    
+                    # Set response
+                    set_response({
+                        "status": resp.status,
+                        "status_text": resp.reason,
+                        "headers": dict(resp.headers),
+                        "body": response_text
+                    })
+                    set_response_time(f"{response_time_ms:.2f} ms")
+                    set_response_size(response_size_str)
+        except Exception as e:
+            set_response({
+                "error": str(e)
+            })
+            set_response_time("0 ms")
+            set_response_size("0 B")
+    
+    # Format JSON response
+    def format_json_response(body):
+        try:
+            parsed_json = json.loads(body)
+            return json.dumps(parsed_json, indent=2)
+        except:
+            return body
+    
+    # Create a new collection
+    def create_collection():
+        collection_id = str(uuid.uuid4())
+        new_collection = {
+            "id": collection_id,
+            "name": f"Collection {len(collections) + 1}",
+            "requests": []
+        }
+        set_collections([*collections, new_collection])
+        set_active_collection(collection_id)
+    
+    # Save request to collection
+    def save_request_to_collection():
+        if active_collection:
+            request_data = {
+                "id": str(uuid.uuid4()),
+                "name": request_tabs[active_request_tab]["name"],
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "params": params,
+                "body_type": body_type,
+                "body_content": body_content,
+                "auth_type": auth_type,
+                "auth_data": auth_data
+            }
+            
+            new_collections = collections.copy()
+            for i, collection in enumerate(new_collections):
+                if collection["id"] == active_collection:
+                    new_collections[i]["requests"].append(request_data)
+                    break
+            
+            set_collections(new_collections)
+            
+            # Update tab saved state
+            new_tabs = request_tabs.copy()
+            new_tabs[active_request_tab]["saved"] = True
+            set_request_tabs(new_tabs)
+    
+    # Render the UI
+    return html.div({"style": styles["app"]},
+        # Header
+        html.div({"style": styles["header"]},
+            html.h2({"style": {"margin": "0", "font_weight": "600"}}, "Handler"),
+            html.div({"style": {"margin_left": "auto", "display": "flex", "align_items": "center", "gap": "16px"}},
+                html.button({"style": {**styles["button_secondary"], "color": "white"}}, "Import"),
+                html.button({"style": styles["button_secondary"]}, "Sync"),
+                html.button({"style": styles["button"]}, "Settings")
+            )
+        ),
+        
+        # Main content
+        html.div({"style": styles["main"]},
+            # Sidebar
+            html.div({"style": styles["sidebar"]},
+                html.h3({"style": {"margin_top": "0"}}, "Workspace"),
+                
+                # Collections
+                html.div(
+                    html.div({"style": {"display": "flex", "justify_content": "space_between", "align_items": "center"}},
+                        html.h4({"style": {"margin": "0"}}, "Collections"),
+                        html.button({
+                            "style": {**styles["button_secondary"], "padding": "4px 8px", "font_size": "12px"},
+                            "on_click": lambda event: create_collection()
+                        }, "+ New")
+                    ),
+                    html.ul({"style": styles["collection_list"]},
+                        [html.li({
+                            "key": collection["id"],
+                            "style": {**styles["collection_item"], "background_color": theme["primary_light"] if active_collection == collection["id"] else "transparent"},
+                            "on_click": lambda event, cid=collection["id"]: set_active_collection(cid)
+                        },
+                            collection["name"],
+                            html.span({"style": {**styles["badge"], "background_color": theme["primary"], "color": "white", "margin_left": "8px"}}, 
+                                     str(len(collection["requests"])))
+                        ) for collection in collections]
+                    )
+                ),
+                
+                # History
+                html.div({"style": {"margin_top": "24px"}},
+                    html.h4({"style": {"margin": "0"}}, "History"),
+                    html.input({
+                        "type": "text",
+                        "placeholder": "Search history...",
+                        "value": history_search,
+                        "on_change": lambda event: set_history_search(event["target"]["value"]),
+                        "style": styles["input"]
+                    }),
+                    html.ul({"style": styles["history_list"]},
+                        [html.li({
+                            "key": item["id"],
+                            "style": styles["history_item"],
+                            "on_click": lambda event, item=item: (
+                                set_method(item["method"]),
+                                set_url(item["url"]),
+                                set_active_tab("builder")
+                            )
+                        },
+                            html.span({"style": {**styles["method_badge"], "background_color": method_colors.get(item["method"], "#757575")}}, 
+                                     item["method"]),
+                            html.span({"style": {"flex_grow": 1, "margin_left": "8px"}}, item["url"]),
+                            html.span({"style": {"font_size": "12px", "color": theme["text_secondary"]}}, 
+                                     item["timestamp"].strftime("%H:%M"))
+                        ) for item in history if history_search.lower() in item["url"].lower() or history_search.lower() in item["method"].lower()]
+                    )
+                ),
+                
+                # Environments
+                html.div({"style": {"margin_top": "24px"}},
+                    html.h4({"style": {"margin": "0"}}, "Environments"),
+                    html.button({
+                        "style": {**styles["button_secondary"], "padding": "4px 8px", "font_size": "12px", "width": "100%"},
+                        "on_click": lambda event: set_environments([*environments, {"id": str(uuid.uuid4()), "name": "New Environment", "variables": []}])
+                    }, "+ 
