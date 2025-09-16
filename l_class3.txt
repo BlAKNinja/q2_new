@@ -1,434 +1,375 @@
-
-"""
-postman_clone.py
-
-Run:
-    pip install reactpy httpx
-    python postman_clone.py
-
-Open http://localhost:8000 in your browser.
-
-Notes:
-- This uses server-side HTTP requests via httpx (so CORS is not an issue).
-- History is stored in-memory (lost when server restarts). See comments for how to add file persistence or browser localStorage.
-- For production, run behind a proper ASGI server.
-"""
-
-import asyncio
+ 
+from reactpy import component, html, hooks, run
+from reactpy.backend.starlette import configure
+from starlette.applications import Starlette
 import json
-import time
-from typing import List, Dict, Any
+import aiohttp
+import asyncio
+from datetime import datetime
 
-import httpx
-from reactpy import component, html, use_state, run, hooks
-
-# Simple dataclasses would be nicer but keeping plain dicts for brevity
-
-
+# Main application component
 @component
-def PostmanClone():
-    # Request builder state
-    method, set_method = use_state("GET")
-    url, set_url = use_state("")
-    headers, set_headers = use_state([{"id": 1, "key": "", "value": ""}])
-    body, set_body = use_state("")
-    body_type, set_body_type = use_state("raw")  # raw | form
+def Handler():
+    # State for various application features
+    current_tab, set_current_tab = hooks.use_state("builder")
+    requests, set_requests = hooks.use_state([])
+    collections, set_collections = hooks.use_state([])
+    history, set_history = hooks.use_state([])
+    search_term, set_search_term = hooks.use_state("")
+    
+    # Current request details
+    method, set_method = hooks.use_state("GET")
+    url, set_url = hooks.use_state("")
+    headers, set_headers = hooks.use_state([{"key": "", "value": ""}])
+    body, set_body = hooks.use_state("")
+    response, set_response = hooks.use_state(None)
+    
+    # Filter history based on search term
+    filtered_history = [
+        h for h in history
+        if search_term.lower() in h["url"].lower() or 
+           search_term.lower() in h["method"].lower()
+    ] if search_term else history
 
-    # Response + UI state
-    response, set_response = use_state(None)  # dict with status, headers, body, time_ms, size
-    status_info, set_status_info = use_state({"status": None, "status_text": ""})
-    is_loading, set_is_loading = use_state(False)
+    # Function to add request to history
+    def add_to_history(req_method, req_url, req_headers, req_body, resp):
+        new_entry = {
+            "id": len(history) + 1,
+            "method": req_method,
+            "url": req_url,
+            "headers": req_headers,
+            "body": req_body,
+            "response": resp,
+            "timestamp": datetime.now().isoformat()
+        }
+        set_history([new_entry] + history)
+        return new_entry
 
-    # History stored server-side (per-process); newest first
-    history, set_history = use_state([])  # each item: dict {id, ts, method, url, headers, body_type, body, response}
-
-    selected_history_id, set_selected_history_id = use_state(None)
-
-    # Helpers for headers
-    def add_header_row(event=None):
-        set_headers(lambda h: h + [{"id": int(time.time() * 1000), "key": "", "value": ""}])
-
-    def update_header_row(row_id, field, value):
-        def updater(h):
-            return [({**r, field: value} if r["id"] == row_id else r) for r in h]
-
-        set_headers(updater)
-
-    def remove_header_row(row_id):
-        set_headers(lambda h: [r for r in h if r["id"] != row_id] or [{"id": 1, "key": "", "value": ""}])
-
-    def build_headers_object():
-        obj = {}
-        for r in headers:
-            k = (r.get("key") or "").strip()
-            if k:
-                obj[k] = r.get("value", "")
-        return obj
-
-    # Async send request - uses httpx for server-side request
-    async def send_request(_event=None, save_to_history: bool = True):
-        if not url.strip():
-            # Using browser alert is possible with reactpy/js interop, but keep simple: set response with error
-            set_response({"status": 0, "status_text": "NO URL", "headers": {}, "body": "Please enter a URL", "time_ms": 0, "size": 0})
-            return
-
-        set_is_loading(True)
-        set_response(None)
-        set_status_info({"status": None, "status_text": ""})
-        start = time.time()
-
-        req_headers = build_headers_object()
-        # If body is JSON-like and Content-Type not set, set it
-        if method not in ("GET", "HEAD"):
-            if body_type == "raw":
-                if "content-type" not in {k.lower() for k in req_headers}:
-                    # try to detect JSON
-                    jb = body.strip()
-                    if (jb.startswith("{") and jb.endswith("}")) or (jb.startswith("[") and jb.endswith("]")):
-                        req_headers["Content-Type"] = "application/json"
-            else:
-                req_headers["Content-Type"] = "application/x-www-form-urlencoded"
-
-        res_obj = {"status": 0, "status_text": "", "headers": {}, "body": "", "time_ms": 0, "size": 0}
-
-        # perform httpx request with timeout and follow redirects
+    # Function to send API request
+    async def send_request():
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-                # build kwargs
-                kwargs = {"headers": req_headers}
-                if method not in ("GET", "HEAD"):
-                    if body_type == "raw":
-                        kwargs["content"] = body.encode("utf-8")
-                    else:
-                        # treat body as lines key=value
-                        data = {}
-                        for line in body.splitlines():
-                            if "=" in line:
-                                k, v = line.split("=", 1)
-                                data[k.strip()] = v.strip()
-                        kwargs["data"] = data
-
-                http_response = await client.request(method, url, **kwargs)
-
-                res_obj["status"] = http_response.status_code
-                res_obj["status_text"] = http_response.reason_phrase or ""
-                # headers
-                res_obj["headers"] = dict(http_response.headers)
-                content_type = http_response.headers.get("content-type", "")
-                # attempt to decode JSON if content-type indicates
-                try:
-                    if "application/json" in content_type.lower():
-                        res_body_text = json.dumps(http_response.json(), indent=2)
-                    else:
-                        res_body_text = http_response.text
-                except Exception:
-                    # fallback to text
-                    res_body_text = http_response.text
-
-                res_obj["body"] = res_body_text
-                res_obj["size"] = len(res_body_text.encode("utf-8"))
-                res_obj["time_ms"] = int((time.time() - start) * 1000)
-
-                set_response(res_obj)
-                set_status_info({"status": res_obj["status"], "status_text": res_obj["status_text"]})
-
-                if save_to_history:
-                    hist_item = {
-                        "id": int(time.time() * 1000),
-                        "ts": time.time(),
-                        "method": method,
-                        "url": url,
-                        "headers": build_headers_object(),
-                        "body_type": body_type,
-                        "body": body,
-                        "response": res_obj,
-                    }
-                    set_history(lambda h: [hist_item] + h[:199])  # keep up to 200
-                    set_selected_history_id(hist_item["id"])
-
-        except Exception as e:
-            res_obj["body"] = str(e)
-            res_obj["status_text"] = "NETWORK ERROR"
-            res_obj["time_ms"] = int((time.time() - start) * 1000)
-            set_response(res_obj)
-            if save_to_history:
-                hist_item = {
-                    "id": int(time.time() * 1000),
-                    "ts": time.time(),
+            async with aiohttp.ClientSession() as session:
+                request_data = {
                     "method": method,
                     "url": url,
-                    "headers": build_headers_object(),
-                    "body_type": body_type,
-                    "body": body,
-                    "response": res_obj,
+                    "headers": {h["key"]: h["value"] for h in headers if h["key"] and h["value"]},
+                    "data": body if body and method in ["POST", "PUT", "PATCH"] else None
                 }
-                set_history(lambda h: [hist_item] + h[:199])
-                set_selected_history_id(hist_item["id"])
-        finally:
-            set_is_loading(False)
-
-    # load a history item into UI
-    def load_history_item(item):
-        set_method(item["method"])
-        set_url(item["url"])
-        hdrs = item.get("headers", {}) or {}
-        if hdrs:
-            set_headers([{"id": i + 1, "key": k, "value": v} for i, (k, v) in enumerate(hdrs.items())])
-        else:
-            set_headers([{"id": 1, "key": "", "value": ""}])
-        set_body(item.get("body", ""))
-        set_body_type(item.get("body_type", "raw"))
-        set_response(item.get("response"))
-        set_selected_history_id(item["id"])
-
-    # clear history
-    def clear_history(event=None):
-        set_history([])
-        set_selected_history_id(None)
-
-    # Small helper to format timestamp
-    def human_ts(ts):
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-
-    # UI rendering
-    return html.div(
-        {"class_": "h-screen grid grid-cols-5 gap-2 bg-gray-100 font-sans"},
-        # Left: history
-        html.aside(
-            {"class_": "col-span-1 bg-white border-r p-2 flex flex-col"},
-            html.div(
-                {"class_": "flex items-center justify-between mb-2"},
-                html.h2({"class_": "font-semibold"}, "History"),
-                html.div({"class_": "text-sm text-gray-500"}, str(len(history))),
-            ),
-            html.div(
-                {"class_": "flex-1 overflow-auto"},
-                html.div({"class_": "text-sm text-gray-500"} if not history else None, "No requests yet" if not history else None),
-                html.ul(
-                    {},
-                    *[
-                        html.li(
-                            {
-                                "key": item["id"],
-                                "on_click": lambda ev, _item=item: load_history_item(_item),
-                                "class_": (
-                                    "cursor-pointer p-2 rounded mb-1 " +
-                                    ("bg-blue-50 border-l-4 border-blue-400" if selected_history_id == item["id"] else "hover:bg-gray-50")
-                                ),
-                            },
-                            html.div(
-                                {"class_": "flex items-center justify-between"},
-                                html.div({"class_": "text-xs font-mono"}, human_ts(item["ts"])),
-                                html.div({"class_": "text-xs text-gray-500"}, str(item.get("response", {}).get("status", "-"))),
-                            ),
-                            html.div(
-                                {"class_": "mt-1 flex items-center gap-2"},
-                                html.div({"class_": "text-xs px-2 py-1 rounded bg-gray-100 font-semibold"}, item["method"]),
-                                html.div({"class_": "text-sm truncate"}, item["url"]),
-                            ),
-                        )
-                        for item in history
-                    ],
-                ),
-            ),
-            html.div(
-                {"class_": "mt-2 flex gap-2"},
-                html.button(
-                    {"on_click": lambda ev: asyncio.create_task(asyncio.to_thread(lambda: None)),
-                     "class_": "flex-1 bg-gray-200 py-2 rounded", "title": "Export first 50 history items to clipboard"},
-                    "Export",
-                ),
-                html.button({"on_click": clear_history, "class_": "flex-1 bg-red-500 text-white py-2 rounded"}, "Clear"),
-            ),
-        ),
-        # Main: request and response builder
-        html.main(
-            {"class_": "col-span-3 p-4 flex flex-col gap-3"},
-            html.div(
-                {"class_": "flex gap-2"},
-                # method select
-                html.select(
-                    {
-                        "value": method,
-                        "on_change": lambda ev: set_method(ev.target.value),
-                        "class_": "w-24 p-2 rounded border",
-                    },
-                    *[html.option({"value": m, "key": m}, m) for m in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")]
-                ),
-                # url
-                html.input(
-                    {
-                        "value": url,
-                        "on_change": lambda ev: set_url(ev.target.value),
-                        "placeholder": "https://api.example.com/path",
-                        "class_": "flex-1 p-2 rounded border",
+                
+                async with session.request(**request_data) as resp:
+                    response_data = {
+                        "status": resp.status,
+                        "headers": dict(resp.headers),
+                        "text": await resp.text(),
+                        "url": str(resp.url)
                     }
-                ),
-                # send button
-                html.button(
-                    {"on_click": lambda ev: asyncio.create_task(send_request(ev, True)),
-                     "disabled": is_loading,
-                     "class_": f"px-4 py-2 rounded {'bg-gray-400' if is_loading else 'bg-blue-600 text-white'}"},
-                    "Sending..." if is_loading else "Send",
-                ),
-                html.button(
-                    {
-                        "on_click": lambda ev: (set_url(""), set_body(""), set_headers([{"id": 1, "key": "", "value": ""}]), set_response(None)),
-                        "class_": "px-3 py-2 rounded border",
-                    },
-                    "Reset",
-                ),
-            ),
-            # headers + body in one row
-            html.div(
-                {"class_": "flex gap-4"},
-                # headers editor
-                html.div(
-                    {"class_": "flex-1 bg-white rounded border p-3"},
-                    html.div(
-                        {"class_": "flex items-center justify-between mb-2"},
-                        html.h3({"class_": "font-medium"}, "Headers"),
-                        html.div(
-                            {"class_": "flex items-center gap-2"},
-                            html.button({"on_click": add_header_row, "class_": "text-sm px-2 py-1 rounded border"}, "+ Add"),
-                        ),
-                    ),
-                    html.div(
-                        {"class_": "space-y-2 max-h-56 overflow-auto"},
-                        *[
-                            html.div(
-                                {"class_": "flex gap-2 items-center", "key": r["id"]},
-                                html.input(
-                                    {
-                                        "value": r["key"],
-                                        "on_change": (lambda rid: (lambda ev: update_header_row(rid, "key", ev.target.value)))(r["id"]),
-                                        "placeholder": "Header name",
-                                        "class_": "w-40 p-1 rounded border",
-                                    }
-                                ),
-                                html.input(
-                                    {
-                                        "value": r["value"],
-                                        "on_change": (lambda rid: (lambda ev: update_header_row(rid, "value", ev.target.value)))(r["id"]),
-                                        "placeholder": "Header value",
-                                        "class_": "flex-1 p-1 rounded border",
-                                    }
-                                ),
-                                html.button(
-                                    {"on_click": (lambda rid: (lambda ev: remove_header_row(rid)))(r["id"]), "class_": "px-2 py-1 rounded border"},
-                                    "Del",
-                                ),
-                            )
-                            for r in headers
-                        ],
-                    ),
-                ),
-                # body editor
-                html.div(
-                    {"class_": "flex-1 bg-white rounded border p-3"},
-                    html.div(
-                        {"class_": "flex items-center justify-between mb-2"},
-                        html.h3({"class_": "font-medium"}, "Body"),
-                        html.div(
-                            {"class_": "flex items-center gap-2"},
-                            html.select(
-                                {
-                                    "value": body_type,
-                                    "on_change": lambda ev: set_body_type(ev.target.value),
-                                    "class_": "p-1 border rounded text-sm",
-                                },
-                                html.option({"value": "raw"}, "raw"),
-                                html.option({"value": "form"}, "form"),
-                            ),
-                            html.div({"class_": "text-xs text-gray-500"}, "Ignored for GET/HEAD" if method in ("GET", "HEAD") else ""),
-                        ),
-                    ),
-                    html.textarea(
-                        {
-                            "value": body,
-                            "on_change": lambda ev: set_body(ev.target.value),
-                            "placeholder": '{\n  "key": "value"\n}' if body_type == "raw" else "key=value\nother=val",
-                            "class_": "w-full h-48 p-2 rounded border font-mono",
-                        }
-                    ),
-                ),
-            ),
-            # response header row
-            html.div(
-                {"class_": "bg-white rounded border p-3 flex items-center justify-between"},
-                html.div(
-                    {"class_": "flex items-center gap-4"},
-                    html.div({"class_": "text-sm"}, "Status: "),
-                    html.div({"class_": "font-mono"}, str(status_info.get("status") or "-")),
-                    html.div({"class_": "text-sm text-gray-500"}, status_info.get("status_text") or ""),
-                    html.div({"class_": "text-sm text-gray-500"}, f"Time: {response['time_ms']} ms" if response else "Time: -"),
-                    html.div({"class_": "text-sm text-gray-500"}, f"Size: {response['size']} bytes" if response else "Size: -"),
-                ),
-                html.div(
-                    {"class_": "flex gap-2"},
-                    html.button(
-                        {
-                            "on_click": lambda ev: (
-                                asyncio.create_task(asyncio.to_thread(lambda: None)),
-                                # we cannot directly access clipboard here server-side; client-side clipboard would need JS interop.
-                            ),
-                            "class_": "px-3 py-1 border rounded",
-                            "title": "Copy Body (client clipboard requires JS interop)",
-                        },
-                        "Copy Body",
-                    ),
-                    html.button({"on_click": lambda ev: None, "class_": "px-3 py-1 border rounded"}, "Copy Headers"),
-                    html.button(
-                        {
-                            "on_click": lambda ev: None,
-                            "class_": "px-3 py-1 border rounded",
-                        },
-                        "Download",
-                    ),
-                ),
-            ),
-            # response panel
-            html.div(
-                {"class_": "flex-1 bg-white rounded border p-3 overflow-auto"},
-                (html.div({"class_": "text-gray-500"}, "No response yet. Click Send.") if not response else None),
-                (response and html.div(
-                    {"class_": "space-y-3"},
-                    html.div(
-                        {},
-                        html.h4({"class_": "font-medium mb-1"}, "Response Body"),
-                        html.pre({"class_": "bg-gray-50 rounded p-3 max-h-64 overflow-auto whitespace-pre-wrap font-mono text-sm"}, response["body"]),
-                    ),
-                    html.div(
-                        {},
-                        html.h4({"class_": "font-medium mb-1"}, "Response Headers"),
-                        html.pre({"class_": "bg-gray-50 rounded p-3 max-h-40 overflow-auto font-mono text-sm"}, json.dumps(response["headers"], indent=2)),
-                    ),
-                )),
-            ),
+                    set_response(response_data)
+                    add_to_history(method, url, headers, body, response_data)
+        except Exception as e:
+            error_response = {"error": str(e)}
+            set_response(error_response)
+            add_to_history(method, url, headers, body, error_response)
+
+    # Function to update header key-value pairs
+    def update_header(index, field, value):
+        new_headers = headers.copy()
+        new_headers[index][field] = value
+        set_headers(new_headers)
+
+    # Function to add new header field
+    def add_header():
+        set_headers(headers + [{"key": "", "value": ""}])
+
+    # Function to remove header field
+    def remove_header(index):
+        if len(headers) > 1:
+            new_headers = headers.copy()
+            new_headers.pop(index)
+            set_headers(new_headers)
+
+    # UI components with deep purple theme
+    deep_purple_theme = {
+        "primary": "#5E35B1",
+        "primary_light": "#9575CD",
+        "primary_dark": "#4527A0",
+        "secondary": "#EDE7F6",
+        "text_on_primary": "#FFFFFF",
+        "text_on_secondary": "#212121",
+        "background": "#F5F5F5",
+        "card_bg": "#FFFFFF",
+        "border": "#B39DDB"
+    }
+
+    # Style definitions
+    styles = {
+        "container": {
+            "display": "flex",
+            "flex_direction": "column",
+            "height": "100vh",
+            "font_family": "'Inter', sans-serif",
+            "background_color": deep_purple_theme["background"]
+        },
+        "header": {
+            "padding": "1rem",
+            "background_color": deep_purple_theme["primary"],
+            "color": deep_purple_theme["text_on_primary"],
+            "display": "flex",
+            "align_items": "center",
+            "gap": "1rem"
+        },
+        "main": {
+            "display": "flex",
+            "flex_grow": 1,
+            "overflow": "hidden"
+        },
+        "sidebar": {
+            "width": "250px",
+            "background_color": deep_purple_theme["primary_light"],
+            "color": deep_purple_theme["text_on_primary"],
+            "padding": "1rem",
+            "overflow_y": "auto"
+        },
+        "content": {
+            "flex_grow": 1,
+            "padding": "1rem",
+            "overflow_y": "auto",
+            "background_color": deep_purple_theme["card_bg"]
+        },
+        "tab_container": {
+            "display": "flex",
+            "border_bottom": f"1px solid {deep_purple_theme['border']}",
+            "margin_bottom": "1rem"
+        },
+        "tab": {
+            "padding": "0.5rem 1rem",
+            "cursor": "pointer",
+            "border_bottom": "2px solid transparent"
+        },
+        "active_tab": {
+            "padding": "0.5rem 1rem",
+            "cursor": "pointer",
+            "border_bottom": f"2px solid {deep_purple_theme['primary']}",
+            "color": deep_purple_theme["primary"]
+        },
+        "input": {
+            "padding": "0.5rem",
+            "border": f"1px solid {deep_purple_theme['border']}",
+            "border_radius": "4px",
+            "margin_bottom": "0.5rem",
+            "width": "100%"
+        },
+        "select": {
+            "padding": "0.5rem",
+            "border": f"1px solid {deep_purple_theme['border']}",
+            "border_radius": "4px",
+            "margin_right": "0.5rem"
+        },
+        "button": {
+            "padding": "0.5rem 1rem",
+            "background_color": deep_purple_theme["primary"],
+            "color": deep_purple_theme["text_on_primary"],
+            "border": "none",
+            "border_radius": "4px",
+            "cursor": "pointer"
+        },
+        "button_secondary": {
+            "padding": "0.5rem 1rem",
+            "background_color": deep_purple_theme["secondary"],
+            "color": deep_purple_theme["text_on_secondary"],
+            "border": f"1px solid {deep_purple_theme['border']}",
+            "border_radius": "4px",
+            "cursor": "pointer"
+        },
+        "request_builder": {
+            "background_color": deep_purple_theme["card_bg"],
+            "padding": "1rem",
+            "border_radius": "4px",
+            "box_shadow": "0 2px 4px rgba(0,0,0,0.1)"
+        },
+        "response_container": {
+            "margin_top": "1rem",
+            "padding": "1rem",
+            "background_color": deep_purple_theme["card_bg"],
+            "border_radius": "4px",
+            "box_shadow": "0 2px 4px rgba(0,0,0,0.1)",
+            "max_height": "400px",
+            "overflow_y": "auto"
+        },
+        "history_item": {
+            "padding": "0.5rem",
+            "border_bottom": f"1px solid {deep_purple_theme['border']}",
+            "cursor": "pointer"
+        }
+    }
+
+    # Tab navigation
+    tabs = [
+        {"id": "builder", "label": "Request Builder"},
+        {"id": "collections", "label": "Collections"},
+        {"id": "history", "label": "History"}
+    ]
+
+    # Request method options
+    methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+
+    # Build the UI
+    return html.div({"style": styles["container"]},
+        # Header
+        html.header({"style": styles["header"]},
+            html.h2({"style": {"margin": "0"}}, "Handler API Client"),
+            html.span({"style": {"font_size": "0.9rem", "opacity": "0.8"}}, 
+                     "Deep Purple Edition")
         ),
-        # Right inspector
-        html.aside(
-            {"class_": "col-span-1 p-3"},
-            html.div(
-                {"class_": "bg-white rounded border p-3"},
-                html.h3({"class_": "font-medium mb-2"}, "Inspector"),
-                html.div({"class_": "text-sm text-gray-600"}, "Quick actions and info"),
-                html.div(
-                    {"class_": "mt-3 text-sm"},
-                    html.div({"class_": "mb-2"}, html.b({}, "Saved Requests:"), f" {len(history)}"),
-                    html.div({"class_": "mb-2"}, html.b({}, "Selected:"), f" {selected_history_id or '-'}"),
-                    html.div({"class_": "mb-2"}, html.b({}, "Current URL:"), html.div({"class_": "text-xs font-mono break-words"}, url or "-")),
-                ),
+        
+        # Main content area
+        html.div({"style": styles["main"]},
+            # Sidebar
+            html.div({"style": styles["sidebar"]},
+                html.h3("Workspace"),
+                html.ul(
+                    html.li("Collections"),
+                    html.li("Environments"),
+                    html.li("History")
+                )
             ),
-        ),
+            
+            # Content area
+            html.div({"style": styles["content"]},
+                # Tab navigation
+                html.div({"style": styles["tab_container"]},
+                    [html.span({
+                        "key": tab["id"],
+                        "style": styles["active_tab"] if current_tab == tab["id"] else styles["tab"],
+                        "on_click": lambda event, t=tab["id"]: set_current_tab(t)
+                    }, tab["label"]) for tab in tabs]
+                ),
+                
+                # Request Builder Tab
+                current_tab == "builder" and html.div(
+                    html.div({"style": styles["request_builder"]},
+                        # Method and URL section
+                        html.div({"style": {"display": "flex", "margin_bottom": "1rem"}},
+                            html.select({
+                                "value": method,
+                                "on_change": lambda event: set_method(event["target"]["value"]),
+                                "style": styles["select"]
+                            }, [html.option({"value": m}, m) for m in methods]),
+                            html.input({
+                                "type": "text",
+                                "placeholder": "Enter request URL",
+                                "value": url,
+                                "on_change": lambda event: set_url(event["target"]["value"]),
+                                "style": {**styles["input"], "margin_bottom": "0"}
+                            })
+                        ),
+                        
+                        # Headers section
+                        html.div({"style": {"margin_bottom": "1rem"}},
+                            html.h4("Headers"),
+                            [html.div({"key": f"header-{i}", "style": {"display": "flex", "margin_bottom": "0.5rem"}},
+                                html.input({
+                                    "type": "text",
+                                    "placeholder": "Key",
+                                    "value": header["key"],
+                                    "on_change": lambda event, idx=i: update_header(idx, "key", event["target"]["value"]),
+                                    "style": {**styles["input"], "margin_right": "0.5rem", "margin_bottom": "0"}
+                                }),
+                                html.input({
+                                    "type": "text",
+                                    "placeholder": "Value",
+                                    "value": header["value"],
+                                    "on_change": lambda event, idx=i: update_header(idx, "value", event["target"]["value"]),
+                                    "style": {**styles["input"], "margin_right": "0.5rem", "margin_bottom": "0"}
+                                }),
+                                html.button({
+                                    "on_click": lambda event, idx=i: remove_header(idx),
+                                    "style": {**styles["button_secondary"], "margin_bottom": "0"}
+                                }, "Remove")
+                            ) for i, header in enumerate(headers)],
+                            html.button({
+                                "on_click": lambda event: add_header(),
+                                "style": styles["button_secondary"]
+                            }, "Add Header")
+                        ),
+                        
+                        # Body section
+                        html.div({"style": {"margin_bottom": "1rem"}},
+                            html.h4("Body"),
+                            html.textarea({
+                                "placeholder": "Request body (JSON, text, etc.)",
+                                "value": body,
+                                "on_change": lambda event: set_body(event["target"]["value"]),
+                                "style": {**styles["input"], "height": "100px"}
+                            })
+                        ),
+                        
+                        # Send button
+                        html.button({
+                            "on_click": lambda event: asyncio.ensure_future(send_request()),
+                            "style": styles["button"]
+                        }, "Send Request")
+                    ),
+                    
+                    # Response section
+                    response and html.div({"style": styles["response_container"]},
+                        html.h4("Response"),
+                        html.pre(
+                            json.dumps(response, indent=2) if isinstance(response, dict) else str(response)
+                        )
+                    )
+                ),
+                
+                # History Tab
+                current_tab == "history" and html.div(
+                    html.div(
+                        html.h3("Request History"),
+                        html.input({
+                            "type": "text",
+                            "placeholder": "Search history...",
+                            "value": search_term,
+                            "on_change": lambda event: set_search_term(event["target"]["value"]),
+                            "style": styles["input"]
+                        }),
+                        html.div(
+                            [html.div({
+                                "key": f"history-{item['id']}",
+                                "style": styles["history_item"],
+                                "on_click": lambda event, h=item: (
+                                    set_method(h["method"]),
+                                    set_url(h["url"]),
+                                    set_headers(h["headers"]),
+                                    set_body(h["body"]),
+                                    set_response(h["response"]),
+                                    set_current_tab("builder")
+                                )
+                            },
+                                html.span({"style": {"font_weight": "bold", "margin_right": "0.5rem"}}, 
+                                         item["method"]),
+                                html.span(item["url"]),
+                                html.br(),
+                                html.span({"style": {"font_size": "0.8rem", "color": "#666"}}, 
+                                         item["timestamp"][:10])
+                            ) for item in filtered_history]
+                        )
+                    )
+                ),
+                
+                # Collections Tab
+                current_tab == "collections" and html.div(
+                    html.h3("Collections"),
+                    html.p("Create and manage your API collections"),
+                    html.button({
+                        "style": styles["button"]
+                    }, "New Collection")
+                )
+            )
+        )
     )
 
-
-def main():
-    # Run the reactpy app on http://localhost:8000
-    print("Starting PostmanClone on http://localhost:8000")
-    run(PostmanClone, debug=True, host="0.0.0.0", port=8000)
-
+# Configure and run the application
+app = Starlette()
+configure(app, Handler)
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
