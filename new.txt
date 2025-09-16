@@ -852,3 +852,279 @@ configure(app, Handler)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# Part 3/3: Main Application Component and Entry Point (Fixed Collection Button)
+@component
+def RequestTabs(request_tabs, active_request_tab, set_active_request_tab, set_request_tabs):
+    def add_request_tab():
+        new_tab = {
+            "id": str(uuid.uuid4()),
+            "name": "New Request",
+            "saved": False
+        }
+        set_request_tabs([*request_tabs, new_tab])
+        set_active_request_tab(len(request_tabs))
+    
+    def close_request_tab(index, event):
+        event.stopPropagation()
+        if len(request_tabs) > 1:
+            new_tabs = request_tabs.copy()
+            new_tabs.pop(index)
+            set_request_tabs(new_tabs)
+            if active_request_tab >= index:
+                set_active_request_tab(max(0, active_request_tab - 1))
+    
+    return html.div({"style": styles["request_tabs"]},
+        [html.div({
+            "key": tab["id"],
+            "style": styles["active_request_tab"] if i == active_request_tab else styles["request_tab"],
+            "on_click": lambda event, idx=i: set_active_request_tab(idx)
+        },
+            html.span(tab["name"]),
+            html.span({
+                "style": {"cursor": "pointer", "font_size": "14px"},
+                "on_click": lambda event, idx=i: close_request_tab(idx, event)
+            }, "×")
+        ) for i, tab in enumerate(request_tabs)],
+        html.div({
+            "style": {**styles["request_tab"], "border_right": "none"},
+            "on_click": lambda event: add_request_tab()
+        }, "+")
+    )
+
+@component
+def MainTabs(active_tab, set_active_tab):
+    return html.div({"style": styles["tabs"]},
+        html.div({
+            "style": styles["active_tab"] if active_tab == "builder" else styles["tab"],
+            "on_click": lambda event: set_active_tab("builder")
+        }, "Request"),
+        html.div({
+            "style": styles["active_tab"] if active_tab == "response" else styles["tab"],
+            "on_click": lambda event: set_active_tab("response")
+        }, "Response"),
+        html.div({
+            "style": styles["active_tab"] if active_tab == "test" else styles["tab"],
+            "on_click": lambda event: set_active_tab("test")
+        }, "Test Results")
+    )
+
+@component
+def Handler():
+    # State for tabs
+    active_tab, set_active_tab = use_state("builder")
+    
+    # State for request builder
+    method, set_method = use_state("GET")
+    url, set_url = use_state("")
+    headers, set_headers = use_state([{"id": str(uuid.uuid4()), "key": "", "value": "", "enabled": True}])
+    params, set_params = use_state([{"id": str(uuid.uuid4()), "key": "", "value": "", "enabled": True}])
+    body_type, set_body_type = use_state("none")
+    body_content, set_body_content = use_state("")
+    auth_type, set_auth_type = use_state("no-auth")
+    auth_data, set_auth_data = use_state({})
+    
+    # State for response
+    response, set_response = use_state(None)
+    response_time, set_response_time = use_state(None)
+    response_size, set_response_size = use_state(None)
+    
+    # State for collections
+    collections, set_collections = use_state([])
+    active_collection, set_active_collection = use_state(None)
+    
+    # State for history
+    history, set_history = use_state([])
+    history_search, set_history_search = use_state("")
+    
+    # State for environments
+    environments, set_environments = use_state([])
+    
+    # State for tabs (multiple requests)
+    request_tabs, set_request_tabs = use_state([{"id": str(uuid.uuid4()), "name": "New Request", "saved": False}])
+    active_request_tab, set_active_request_tab = use_state(0)
+    
+    # Function to create a new collection
+    def create_collection():
+        collection_id = str(uuid.uuid4())
+        new_collection = {
+            "id": collection_id,
+            "name": f"Collection {len(collections) + 1}",
+            "requests": [],
+            "timestamp": datetime.now()
+        }
+        set_collections([*collections, new_collection])
+        set_active_collection(collection_id)
+        return new_collection
+    
+    async def handle_send_request():
+        result = await send_request(method, url, headers, params, body_type, body_content)
+        if result["error"]:
+            set_response({"error": result["error"]})
+        else:
+            set_response(result)
+            set_response_time(f"{result['time']:.2f} ms")
+            set_response_size(result["size"])
+            
+            # Add to history
+            history_item = {
+                "id": str(uuid.uuid4()),
+                "method": method,
+                "url": url,
+                "timestamp": datetime.now(),
+                "status": result["status"],
+                "time": result["time"],
+                "size": result["size"]
+            }
+            set_history([history_item] + history)
+    
+    def handle_save_request():
+        if active_collection:
+            request_data = {
+                "id": str(uuid.uuid4()),
+                "name": request_tabs[active_request_tab]["name"],
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "params": params,
+                "body_type": body_type,
+                "body_content": body_content,
+                "auth_type": auth_type,
+                "auth_data": auth_data,
+                "timestamp": datetime.now()
+            }
+            
+            new_collections = collections.copy()
+            for i, collection in enumerate(new_collections):
+                if collection["id"] == active_collection:
+                    new_collections[i]["requests"].append(request_data)
+                    break
+            
+            set_collections(new_collections)
+            
+            # Update tab saved state
+            new_tabs = request_tabs.copy()
+            new_tabs[active_request_tab]["saved"] = True
+            new_tabs[active_request_tab]["name"] = f"Saved: {method} {url}"[:30]
+            set_request_tabs(new_tabs)
+    
+    # Update the Sidebar component call to pass the create_collection function
+    @component
+    def SidebarWithCreate():
+        return html.div({"style": styles["sidebar"]},
+            html.h3({"style": {"margin_top": "0"}}, "Workspace"),
+            
+            # Collections
+            html.div(
+                html.div({"style": {"display": "flex", "justify_content": "space_between", "align_items": "center"}},
+                    html.h4({"style": {"margin": "0"}}, "Collections"),
+                    html.button({
+                        "style": {**styles["button_secondary"], "padding": "4px 8px", "font_size": "12px"},
+                        "on_click": lambda event: create_collection()
+                    }, "+ New")
+                ),
+                html.ul({"style": styles["collection_list"]},
+                    [html.li({
+                        "key": collection["id"],
+                        "style": {**styles["collection_item"], "background_color": theme["primary_light"] if active_collection == collection["id"] else "transparent"},
+                        "on_click": lambda event, cid=collection["id"]: set_active_collection(cid)
+                    },
+                        html.span(collection["name"]),
+                        html.span({"style": {**styles["badge"], "background_color": theme["primary"], "color": "white", "margin_left": "8px"}}, 
+                                 str(len(collection["requests"])))
+                    ) for collection in collections]
+                )
+            ),
+            
+            # History
+            html.div({"style": {"margin_top": "24px"}},
+                html.h4({"style": {"margin": "0"}}, "History"),
+                html.input({
+                    "type": "text",
+                    "placeholder": "Search history...",
+                    "value": history_search,
+                    "on_change": lambda event: set_history_search(event["target"]["value"]),
+                    "style": styles["input"]
+                }),
+                html.ul({"style": styles["history_list"]},
+                    [html.li({
+                        "key": item["id"],
+                        "style": styles["history_item"],
+                        "on_click": lambda event, item=item: (
+                            set_method(item["method"]),
+                            set_url(item["url"]),
+                            set_active_tab("builder")
+                        )
+                    },
+                        html.span({"style": {**styles["method_badge"], "background_color": method_colors.get(item["method"], "#757575")}}, 
+                                 item["method"]),
+                        html.span({"style": {"flex_grow": 1, "margin_left": "8px"}}, item["url"]),
+                        html.span({"style": {"font_size": "12px", "color": theme["text_secondary"]}}, 
+                                 item["timestamp"].strftime("%H:%M"))
+                    ) for item in history if history_search.lower() in item["url"].lower() or history_search.lower() in item["method"].lower()]
+                )
+            ),
+            
+            # Environments
+            html.div({"style": {"margin_top": "24px"}},
+                html.h4({"style": {"margin": "0"}}, "Environments"),
+                html.button({
+                    "style": {**styles["button_secondary"], "padding": "4px 8px", "font_size": "12px", "width": "100%"},
+                    "on_click": lambda event: set_environments([*environments, {"id": str(uuid.uuid4()), "name": "New Environment", "variables": []}])
+                }, "+ New Environment")
+            )
+        )
+    
+    return html.div({"style": styles["app"]},
+        # Header
+        html.div({"style": styles["header"]},
+            html.h2({"style": {"margin": "0", "font_weight": "600"}}, "Handler"),
+            html.div({"style": {"margin_left": "auto", "display": "flex", "align_items": "center", "gap": "16px"}},
+                html.button({"style": {**styles["button_secondary"], "color": "white"}}, "Import"),
+                html.button({"style": styles["button_secondary"]}, "Sync"),
+                html.button({"style": styles["button"]}, "Settings")
+            )
+        ),
+        
+        # Main content
+        html.div({"style": styles["main"]},
+            # Sidebar
+            SidebarWithCreate(),
+            
+            # Content area
+            html.div({"style": styles["content"]},
+                # Request tabs
+                RequestTabs(request_tabs, active_request_tab, set_active_request_tab, set_request_tabs),
+                
+                # Main tabs
+                MainTabs(active_tab, set_active_tab),
+                
+                # Tab content
+                html.div({"style": styles["tab_content"]},
+                    # Request Builder
+                    active_tab == "builder" and RequestBuilder(
+                        method, set_method, url, set_url, headers, set_headers, params, set_params,
+                        body_type, set_body_type, body_content, set_body_content, auth_type, set_auth_type,
+                        handle_send_request, handle_save_request
+                    ),
+                    
+                    # Response Viewer
+                    active_tab == "response" and ResponseViewer(response, response_time, response_size),
+                    
+                    # Test Results
+                    active_tab == "test" and html.div(
+                        html.h3("Test Results"),
+                        html.p("Write tests for your API requests using JavaScript")
+                    )
+                )
+            )
+        )
+    )
+
+# Configure and run the application
+app = Starlette()
+configure(app, Handler)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
